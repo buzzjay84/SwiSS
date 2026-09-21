@@ -5,16 +5,23 @@ name: Build Release from private source
 # (jaybhee84/SwiSS) is checked out read-only with a deploy key, built, and the installers are
 # published to THIS repo's Releases, which is the update source the installed apps read.
 #
-# Start it from the private repo's machine (no Actions needed there):
-#   gh workflow run build-from-private.yml -R buzzjay84/SwiSS -f tag=v2.3.3
-# or from the Actions tab of this repo ("Run workflow").
+# It starts by itself: every 15 minutes it reads package.json on the private repo's main branch and,
+# when that version has no published release yet, builds and publishes it. So pushing a commit that
+# bumps the version is enough; the private repo needs no Actions (its Actions minutes are not used).
+#
+# Manual runs still work (tag is optional):
+#   gh workflow run build-from-private.yml -R buzzjay84/SwiSS                  # build main if it has no release
+#   gh workflow run build-from-private.yml -R buzzjay84/SwiSS -f tag=v2.4.4    # build that tag now
+# or "Run workflow" on the Actions tab of this repo.
 
 on:
+  schedule:
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag in the private source repo to build, e.g. v2.3.3 (must equal package.json version)'
-        required: true
+        description: 'Optional. Tag in the private source repo to build, e.g. v2.4.4 (must equal package.json version). Leave empty to build main when its version has no release yet.'
+        required: false
         type: string
   repository_dispatch:
     types: [build-release]
@@ -22,29 +29,92 @@ on:
 permissions:
   contents: write
 
+# One run at a time, so two runs never publish the same release together.
 concurrency:
-  group: build-release-${{ github.event.inputs.tag || github.event.client_payload.tag }}
+  group: build-release
   cancel-in-progress: false
 
 env:
   SOURCE_REPO: jaybhee84/SwiSS
-  RELEASE_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
 
 jobs:
-  check-tag:
+  # Decides whether there is something to build and from which ref. A version is built once: a
+  # published release for it means "done"; a draft younger than an hour means a build just ran (or
+  # just failed), so a failing version is retried at most about once an hour instead of every 15 minutes.
+  detect:
     runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      tag: ${{ steps.decide.outputs.tag }}
+      ref: ${{ steps.decide.outputs.ref }}
     steps:
-      - name: Tag must look like vX.Y.Z
+      - name: Decide what to build
+        id: decide
         shell: bash
+        env:
+          KEY: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
         run: |
-          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::'$RELEASE_TAG' is not a release tag like v2.3.3" >&2
+          set -euo pipefail
+          dir="${RUNNER_TEMP//\\//}"
+          keyfile="$dir/source_key"
+          printf '%s\n' "$KEY" | tr -d '\r' | sed -e 's/[[:space:]]*$//' -e '/^$/d' > "$keyfile"
+          chmod 600 "$keyfile"
+          if [ "$(head -n 1 "$keyfile")" != "-----BEGIN OPENSSH PRIVATE KEY-----" ] || [ "$(tail -n 1 "$keyfile")" != "-----END OPENSSH PRIVATE KEY-----" ]; then
+            echo "::error::PRIVATE_SOURCE_DEPLOY_KEY is not a complete OpenSSH private key." >&2
             exit 1
           fi
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$dir/known_hosts"
+
+          if [ -n "${REQUESTED:-}" ]; then
+            # An explicit tag: build exactly that, as before.
+            tag="$REQUESTED"
+            ref="$REQUESTED"
+            build=true
+          else
+            git clone --depth 1 --branch main "git@github.com:$SOURCE_REPO.git" probe
+            version=$(node -p "require('./probe/package.json').version")
+            tag="v$version"
+            build=true
+            state=$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft,createdAt --jq '[.isDraft, .createdAt] | @tsv' 2>/dev/null || true)
+            if [ -n "$state" ]; then
+              draft=$(printf '%s' "$state" | cut -f1)
+              created=$(printf '%s' "$state" | cut -f2)
+              age=$(( $(date +%s) - $(date -d "$created" +%s) ))
+              if [ "$draft" = "false" ]; then
+                echo "Release $tag is already published; nothing to build."
+                build=false
+              elif [ "$age" -lt 3600 ]; then
+                echo "A draft for $tag was created ${age}s ago (a build just ran); waiting before retrying."
+                build=false
+              fi
+            fi
+            # Build the private tag when it exists, otherwise the tip of main.
+            if git ls-remote --exit-code --tags "git@github.com:$SOURCE_REPO.git" "refs/tags/$tag" >/dev/null 2>&1; then
+              ref="$tag"
+            else
+              ref=main
+            fi
+          fi
+          rm -f "$keyfile"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$tag' is not a release tag like v2.4.4" >&2
+            exit 1
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Decision: build=$build tag=$tag ref=$ref"
 
   build-windows:
-    needs: check-tag
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+      SOURCE_REF: ${{ needs.detect.outputs.ref }}
     defaults:
       run:
         working-directory: source
@@ -70,7 +140,7 @@ jobs:
           # GitHub's published SSH host key, pinned so the connection cannot be redirected.
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$dir/known_hosts"
           export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$dir/known_hosts"
-          git clone --depth 1 --branch "$RELEASE_TAG" "git@github.com:$SOURCE_REPO.git" source
+          git clone --depth 1 --branch "$SOURCE_REF" "git@github.com:$SOURCE_REPO.git" source
           rm -f "$keyfile"
 
       - uses: actions/setup-node@v4
@@ -99,8 +169,12 @@ jobs:
         run: npm run dist -- --win nsis --publish always
 
   build-macos:
-    needs: check-tag
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
     runs-on: macos-latest
+    env:
+      RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+      SOURCE_REF: ${{ needs.detect.outputs.ref }}
     defaults:
       run:
         working-directory: source
@@ -126,7 +200,7 @@ jobs:
           # GitHub's published SSH host key, pinned so the connection cannot be redirected.
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$dir/known_hosts"
           export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$dir/known_hosts"
-          git clone --depth 1 --branch "$RELEASE_TAG" "git@github.com:$SOURCE_REPO.git" source
+          git clone --depth 1 --branch "$SOURCE_REF" "git@github.com:$SOURCE_REPO.git" source
           rm -f "$keyfile"
 
       - uses: actions/setup-node@v4
@@ -157,8 +231,11 @@ jobs:
         run: npm run dist -- --mac dmg --x64 --arm64 --publish always
 
   publish-release:
-    needs: [build-windows, build-macos]
+    needs: [detect, build-windows, build-macos]
+    if: needs.detect.outputs.build == 'true'
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.detect.outputs.tag }}
     steps:
       - name: Publish the GitHub Release
         env:
