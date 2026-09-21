@@ -45,21 +45,39 @@ jobs:
   build-windows:
     needs: check-tag
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: source
     steps:
-      # Read-only deploy key for the private repo. The key is never printed and no credentials are
-      # left in the workspace. Logs of a public repo are public, so nothing here echoes source.
-      - name: Check out private source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.RELEASE_TAG }}
-          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
-          persist-credentials: false
+      # Read-only deploy key for the private repo. A pasted secret often arrives with Windows line
+      # endings or without the final newline, which makes ssh reject it ("invalid format"), so the key
+      # is normalised first and checked. Nothing here prints the key or any source; logs are public.
+      - name: Check out private source (read-only deploy key)
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          KEY: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP//\\//}"
+          keyfile="$dir/source_key"
+          printf '%s\n' "$KEY" | tr -d '\r' > "$keyfile"
+          chmod 600 "$keyfile"
+          if [ "$(head -n 1 "$keyfile")" != "-----BEGIN OPENSSH PRIVATE KEY-----" ] || [ "$(tail -n 1 "$keyfile")" != "-----END OPENSSH PRIVATE KEY-----" ]; then
+            echo "::error::PRIVATE_SOURCE_DEPLOY_KEY is not a complete OpenSSH private key. It must start with -----BEGIN OPENSSH PRIVATE KEY----- and end with -----END OPENSSH PRIVATE KEY-----. Paste the whole contents of the key file that does NOT end in .pub." >&2
+            exit 1
+          fi
+          # GitHub's published SSH host key, pinned so the connection cannot be redirected.
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$dir/known_hosts"
+          git clone --depth 1 --branch "$RELEASE_TAG" "git@github.com:$SOURCE_REPO.git" source
+          rm -f "$keyfile"
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: source/package-lock.json
 
       - name: Verify tag matches package version
         shell: pwsh
@@ -83,19 +101,39 @@ jobs:
   build-macos:
     needs: check-tag
     runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: source
     steps:
-      - name: Check out private source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.RELEASE_TAG }}
-          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
-          persist-credentials: false
+      # Read-only deploy key for the private repo. A pasted secret often arrives with Windows line
+      # endings or without the final newline, which makes ssh reject it ("invalid format"), so the key
+      # is normalised first and checked. Nothing here prints the key or any source; logs are public.
+      - name: Check out private source (read-only deploy key)
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          KEY: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP//\\//}"
+          keyfile="$dir/source_key"
+          printf '%s\n' "$KEY" | tr -d '\r' > "$keyfile"
+          chmod 600 "$keyfile"
+          if [ "$(head -n 1 "$keyfile")" != "-----BEGIN OPENSSH PRIVATE KEY-----" ] || [ "$(tail -n 1 "$keyfile")" != "-----END OPENSSH PRIVATE KEY-----" ]; then
+            echo "::error::PRIVATE_SOURCE_DEPLOY_KEY is not a complete OpenSSH private key. It must start with -----BEGIN OPENSSH PRIVATE KEY----- and end with -----END OPENSSH PRIVATE KEY-----. Paste the whole contents of the key file that does NOT end in .pub." >&2
+            exit 1
+          fi
+          # GitHub's published SSH host key, pinned so the connection cannot be redirected.
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$dir/known_hosts"
+          git clone --depth 1 --branch "$RELEASE_TAG" "git@github.com:$SOURCE_REPO.git" source
+          rm -f "$keyfile"
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: source/package-lock.json
 
       - name: Verify tag matches package version
         shell: bash
