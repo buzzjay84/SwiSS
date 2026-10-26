@@ -168,6 +168,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run dist -- --win nsis --publish always
 
+      # electron-builder only embeds release-notes.md in latest.yml; it never writes the GitHub
+      # release body. Post the source's notes as the body, but only when the file's heading names
+      # this version ("What's new in SwiSS 2.6.0"), so a stale file never posts last version's notes.
+      - name: Post release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [ ! -f release-notes.md ]; then
+            echo "::warning::No release-notes.md in the source; the release body is left as is."
+          elif ! head -n 5 release-notes.md | grep -qF "SwiSS $version"; then
+            echo "::warning::release-notes.md is not for $version (its heading must name the version); the release body is left as is."
+          else
+            gh release edit "$RELEASE_TAG" --notes-file release-notes.md --repo "${{ github.repository }}"
+            echo "Posted release-notes.md as the $RELEASE_TAG release notes."
+          fi
+
   build-macos:
     needs: detect
     if: needs.detect.outputs.build == 'true'
